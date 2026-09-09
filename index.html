@@ -185,6 +185,11 @@ mark{background:var(--amber-bg);color:var(--amber);border-radius:2px;padding:0 2
       <div class="modal-hint" style="margin-bottom:8px">이 기기에 남은 사본이 원격과 어긋날 때 씁니다. 저장되지 않은 작성분이 있으면 사라집니다.</div>
       <button class="btn btn-ghost" style="width:100%" onclick="resetCache()">로컬 사본 비우고 다시 받기</button>
     </div>
+    <div style="margin-top:14px;padding-top:14px;border-top:1px solid var(--border)">
+      <div class="modal-hint" style="margin-bottom:8px">어느 로그도 가리키지 않는 첨부를 찾아 지웁니다.</div>
+      <button id="sweep-btn" class="btn btn-ghost" style="width:100%" onclick="sweepRaw()">raw 정리 검사</button>
+      <div id="sweep-result" style="font-size:12px;color:var(--text2);margin-top:8px;line-height:1.7"></div>
+    </div>
   </div>
 </div>
 
@@ -1130,6 +1135,70 @@ async function commitFname(e,memoId,attachIdx,uid){
   const el=document.getElementById(`fname-${uid}`);
   if(el)el.textContent=newName;
   await saveMemos();
+}
+
+// ── raw 정리 ──
+// 모든 덩어리의 첨부 참조와 raw/ 목록을 대조해 미참조 파일을 찾는다.
+let sweepList=[];
+
+function fmtSize(b){
+  return b>=1048576?(b/1048576).toFixed(1)+' MB':(b/1024).toFixed(0)+' KB';
+}
+
+async function sweepRaw(){
+  const btn=document.getElementById('sweep-btn');
+  const out=document.getElementById('sweep-result');
+  const token=getToken();const o=getOwner();
+  if(!token||!o){out.textContent='토큰을 먼저 등록하세요.';return;}
+  btn.disabled=true;btn.textContent='검사 중...';
+  out.textContent='';
+  try{
+    await loadAllShards();
+    const res=await fetch(`https://api.github.com/repos/${o}/${GH_REPO_NAME}/contents/${GH_RAW_DIR}`,
+      {headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});
+    if(!res.ok)throw new Error(`HTTP ${res.status}`);
+    const files=(await res.json()).filter(f=>f.type==='file'&&f.name!=='.gitkeep');
+    const used=new Set();
+    for(const m of memos)for(const a of (m.attachments||[]))used.add(a.filename);
+    sweepList=files.filter(f=>!used.has(f.name));
+    const missing=[...used].filter(fn=>!files.some(f=>f.name===fn));
+    const total=sweepList.reduce((s,f)=>s+f.size,0);
+    let html=`파일 ${files.length}개 · 참조 ${used.size}개<br>`;
+    if(missing.length)html+=`<span style="color:var(--red)">참조되나 없는 파일 ${missing.length}개: ${missing.map(escHtml).join(', ')}</span><br>`;
+    if(!sweepList.length){
+      html+='미참조 파일이 없습니다.';
+      out.innerHTML=html;
+    }else{
+      html+=`<b>미참조 ${sweepList.length}개 · ${fmtSize(total)}</b><br>`;
+      html+=sweepList.map(f=>`<code style="color:var(--text3)">${escHtml(f.name)}</code> ${fmtSize(f.size)}`).join('<br>');
+      html+=`<br><button class="btn btn-ghost" style="width:100%;margin-top:8px;color:var(--red)" onclick="sweepDelete()">위 ${sweepList.length}개 삭제</button>`;
+      out.innerHTML=html;
+    }
+  }catch(e){
+    out.innerHTML=`<span style="color:var(--red)">검사 실패: ${escHtml(e.message)}</span>`;
+  }finally{
+    btn.disabled=false;btn.textContent='raw 정리 검사';
+  }
+}
+
+async function sweepDelete(){
+  if(!sweepList.length)return;
+  if(!confirm(`미참조 파일 ${sweepList.length}개를 삭제합니까?\n되돌릴 수 없습니다.`))return;
+  const out=document.getElementById('sweep-result');
+  const token=getToken();const o=getOwner();
+  let done=0,fail=0;
+  for(const f of sweepList){
+    out.textContent=`삭제 중 ${done+fail+1}/${sweepList.length} ${f.name}`;
+    try{
+      const r=await fetch(`https://api.github.com/repos/${o}/${GH_REPO_NAME}/contents/${GH_RAW_DIR}/${f.name}`,
+        {method:'DELETE',
+         headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},
+         body:JSON.stringify({message:`raw sweep ${f.name}`,sha:f.sha})});
+      r.ok?done++:fail++;
+    }catch(e){fail++;}
+  }
+  sweepList=[];
+  out.innerHTML=`삭제 ${done}개 완료${fail?` · 실패 ${fail}개`:''}`;
 }
 
 // ── 출입비번 ──
