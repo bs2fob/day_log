@@ -219,7 +219,7 @@ mark{background:var(--amber-bg);color:var(--amber);border-radius:2px;padding:0 2
       <button class="sc-btn" onclick="insertChar('▻')">▻</button>
       <button class="sc-btn" onclick="insertChar('➢')">➢</button>
     </div>
-    <textarea id="memo-input" class="memo-textarea" placeholder="오늘의 기록..."></textarea>
+    <textarea id="memo-input" class="memo-textarea" placeholder="오늘의 기록..." oninput="saveDraft()"></textarea>
 
     <div class="attach-bar">
       <label class="attach-btn">
@@ -309,6 +309,10 @@ const GH_RAW_DIR='raw';
 const LS_TOKEN='dl_token';
 const LS_OWNER='dl_owner';
 const LS_TAB='dl_last_tab';
+const LS_LOGS='dl_logs';
+const LS_DRAFT='dl_draft';
+const LS_TOMBS='dl_tombs';
+const LS_DIRTY='dl_dirty';
 const CHAIN_WEEKS=10;
 const TABS=['write','weeks','search','chain'];
 
@@ -327,6 +331,58 @@ function rawPublicUrl(filename){
 }
 
 let ghSha=null;
+
+// 로컬 1차 저장소. GitHub 은 동기화 대상이며, 원격이 죽어도 여기 남은 것으로 그린다.
+function cacheSave(){
+  try{localStorage.setItem(LS_LOGS,JSON.stringify(memos));}catch(e){}
+}
+function cacheLoad(){
+  try{const v=JSON.parse(localStorage.getItem(LS_LOGS)||'null');return Array.isArray(v)?v:null;}catch(e){return null;}
+}
+function readTombs(){
+  try{const v=JSON.parse(localStorage.getItem(LS_TOMBS)||'[]');return Array.isArray(v)?v:[];}catch(e){return [];}
+}
+function addTomb(id){
+  const t=readTombs();
+  if(!t.includes(id)){t.push(id);try{localStorage.setItem(LS_TOMBS,JSON.stringify(t));}catch(e){}}
+}
+function setDirty(v){
+  try{v?localStorage.setItem(LS_DIRTY,'1'):localStorage.removeItem(LS_DIRTY);}catch(e){}
+}
+function isDirty(){
+  try{return localStorage.getItem(LS_DIRTY)==='1';}catch(e){return false;}
+}
+
+// 원격과 로컬을 id 기준으로 합친다. 같은 id 는 mt 가 최신인 쪽, 삭제한 id 는 뺀다.
+function mergeLogs(remote,local){
+  const dead=new Set(readTombs());
+  const map=new Map();
+  for(const m of (remote||[]))map.set(m.id,m);
+  for(const m of (local||[])){
+    const r=map.get(m.id);
+    if(!r||(m.mt||0)>=(r.mt||0))map.set(m.id,m);
+  }
+  return [...map.values()].filter(m=>!dead.has(m.id))
+    .sort((a,b)=>a.qc<b.qc?1:a.qc>b.qc?-1:b.id-a.id);
+}
+
+function sameLogs(a,b){
+  return JSON.stringify(a)===JSON.stringify(b);
+}
+
+// 작성 중 초안
+function saveDraft(){
+  try{localStorage.setItem(LS_DRAFT,document.getElementById('memo-input').value);}catch(e){}
+}
+function restoreDraft(){
+  try{
+    const d=localStorage.getItem(LS_DRAFT);
+    if(d)document.getElementById('memo-input').value=d;
+  }catch(e){}
+}
+function clearDraft(){
+  try{localStorage.removeItem(LS_DRAFT);}catch(e){}
+}
 
 function setSyncIndicator(state,text){
   const dot=document.getElementById('sync-dot');
@@ -378,58 +434,83 @@ let memos=[];
 
 async function loadMemos({silent=false}={}){
   const token=getToken();const url=ghApiUrl();
-  if(!token||!url){if(!silent)openSetup();return;}
+  const cached=cacheLoad();
+  if(!token||!url){
+    if(cached){memos=cached;renderAll();}
+    if(!silent)openSetup();
+    return;
+  }
   if(!silent)setSyncIndicator('syncing','불러오는 중...');
   try{
     const res=await fetch(url,{headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});
-    if(res.status===404){memos=[];ghSha=null;setSyncIndicator('ok','새 파일');renderAll();return;}
-    if(!res.ok)throw new Error(`HTTP ${res.status}`);
-    const data=await res.json();
-    ghSha=data.sha;
-    const decoded=decodeURIComponent(escape(atob(data.content.replace(/\n/g,''))));
-    memos=JSON.parse(decoded);
-    setSyncIndicator('ok',`불러옴 ${new Date().toLocaleTimeString()}`);
+    let remote=[];
+    if(res.status===404){ghSha=null;}
+    else if(!res.ok)throw new Error(`HTTP ${res.status}`);
+    else{
+      const data=await res.json();
+      ghSha=data.sha;
+      remote=JSON.parse(decodeURIComponent(escape(atob(data.content.replace(/\n/g,'')))));
+    }
+    memos=mergeLogs(remote,cached);
+    cacheSave();
     renderAll();
+    const needPush=!sameLogs(memos,remote);
+    setSyncIndicator('ok',needPush?'병합분 저장 중...':`불러옴 ${new Date().toLocaleTimeString()}`);
+    if(needPush||isDirty())await saveMemos({fromLoad:true});
   }catch(e){
-    setSyncIndicator('error','불러오기 실패');
-    if(!silent)alert(`불러오기 실패\n${e.message}`);
+    if(cached&&!memos.length){memos=cached;renderAll();}
+    setSyncIndicator('error','불러오기 실패 · 로컬 표시');
+    if(!silent)alert(`불러오기 실패\n로컬에 남은 내용으로 표시합니다.\n${e.message}`);
   }
 }
 
-async function saveMemos(){
+async function fetchRemoteLogs(url,token){
+  const res=await fetch(url,{headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});
+  if(res.status===404){ghSha=null;return [];}
+  if(!res.ok)throw new Error(`HTTP ${res.status}`);
+  const d=await res.json();
+  ghSha=d.sha;
+  return JSON.parse(decodeURIComponent(escape(atob(d.content.replace(/\n/g,'')))));
+}
+
+let saving=false;
+
+// 원격을 읽어 병합한 뒤 올린다. 다른 기기가 쓴 것을 덮지 않는다.
+async function saveMemos({fromLoad=false,quiet=false}={}){
+  cacheSave();
+  setDirty(true);
   const token=getToken();const url=ghApiUrl();
-  if(!token||!url){openSetup();return;}
+  if(!token||!url){if(!quiet)openSetup();return;}
+  if(saving)return;
+  saving=true;
   setSyncIndicator('syncing','저장 중...');
   try{
-    const content=btoa(unescape(encodeURIComponent(JSON.stringify(memos))));
-    if(!ghSha){
-      const r=await fetch(url,{headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});
-      if(r.ok){const d=await r.json();ghSha=d.sha;}
-    }
-    const body={message:`log sync ${buildQcode(new Date())}`,content};
-    if(ghSha)body.sha=ghSha;
-    const res=await fetch(url,{method:'PUT',
-      headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},
-      body:JSON.stringify(body)
-    });
-    if(res.status===409||res.status===422){
-      const r2=await fetch(url,{headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});
-      if(r2.ok){const d2=await r2.json();ghSha=d2.sha;}
-      body.sha=ghSha;
-      const res2=await fetch(url,{method:'PUT',
+    let merged=mergeLogs(await fetchRemoteLogs(url,token),memos);
+    if(!sameLogs(merged,memos)){memos=merged;cacheSave();renderAll();}
+    const put=()=>{
+      const body={message:`log sync ${buildQcode(new Date())}`,
+        content:btoa(unescape(encodeURIComponent(JSON.stringify(memos))))};
+      if(ghSha)body.sha=ghSha;
+      return fetch(url,{method:'PUT',
         headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},
-        body:JSON.stringify(body)
-      });
-      if(!res2.ok)throw new Error(`HTTP ${res2.status}`);
-      const j2=await res2.json();ghSha=j2.content.sha;
-    } else {
-      if(!res.ok)throw new Error(`HTTP ${res.status}`);
-      const j=await res.json();ghSha=j.content.sha;
+        body:JSON.stringify(body)});
+    };
+    let res=await put();
+    if(res.status===409||res.status===422){
+      merged=mergeLogs(await fetchRemoteLogs(url,token),memos);
+      if(!sameLogs(merged,memos)){memos=merged;cacheSave();renderAll();}
+      res=await put();
     }
+    if(!res.ok)throw new Error(`HTTP ${res.status}`);
+    const j=await res.json();
+    ghSha=j.content.sha;
+    setDirty(false);
     setSyncIndicator('ok',`저장됨 ${new Date().toLocaleTimeString()}`);
   }catch(e){
-    setSyncIndicator('error','저장 실패');
-    alert(`저장 실패\n${e.message}`);
+    setSyncIndicator('error','저장 대기 · 로컬 보관');
+    if(!quiet&&!fromLoad)alert(`저장 실패\n내용은 이 기기에 남아 있고 자동으로 다시 시도합니다.\n${e.message}`);
+  }finally{
+    saving=false;
   }
 }
 
@@ -580,6 +661,7 @@ function insertChar(ch){
 
 function clearWrite(){
   document.getElementById('memo-input').value='';
+  clearDraft();
   pendingAttachments.forEach(a=>URL.revokeObjectURL(a.previewUrl));
   pendingAttachments=[];
   renderPreview();
@@ -683,6 +765,7 @@ async function commitEdit(id,ctx='r'){
   const memo=memos.find(m=>m.id===id);
   if(!memo)return;
   memo.body=ta.value.trim();
+  memo.mt=Date.now();
   renderAll();
   await saveMemos();
 }
@@ -739,6 +822,7 @@ async function deleteAttach(memoId,attachIdx){
   const memo=memos.find(m=>m.id==memoId);
   if(!memo||!memo.attachments[attachIdx])return;
   memo.attachments.splice(attachIdx,1);
+  memo.mt=Date.now();
   renderAll();
   await saveMemos();
 }
@@ -806,6 +890,7 @@ async function commitFname(e,memoId,attachIdx,uid){
   const newName=e.target.value.trim();
   if(!newName)return;
   memo.attachments[attachIdx].origName=newName;
+  memo.mt=Date.now();
   const el=document.getElementById(`fname-${uid}`);
   if(el)el.textContent=newName;
   await saveMemos();
@@ -997,7 +1082,8 @@ async function saveMemo(){
     prog.style.display='none';
   }
 
-  memos.unshift({id:Date.now(),qc,body,attachments});
+  const now=Date.now();
+  memos.unshift({id:now,qc,body,attachments,mt:now});
   clearWrite();
   renderAll();
   btn.disabled=false;
@@ -1006,19 +1092,36 @@ async function saveMemo(){
 
 async function deleteMemo(id){
   if(!confirm('이 로그를 삭제합니까?\n(첨부 파일은 raw 폴더에 남습니다)'))return;
+  addTomb(id);
   memos=memos.filter(m=>m.id!==id);
   renderAll();
   await saveMemos();
 }
 
 // ── 초기화 ──
+restoreDraft();
+const boot=cacheLoad();
+if(boot){memos=boot;renderAll();}
+
 updateQnow();
 setInterval(updateQnow,10000);
+
+// 미저장분 자동 재시도
+setInterval(()=>{
+  if(isDirty()&&getToken()&&getOwner())saveMemos({quiet:true});
+},60000);
 
 document.addEventListener('visibilitychange',()=>{
   if(document.visibilityState==='visible'&&getToken()&&getOwner()){
     loadMemos({silent:true});
   }
+});
+
+window.addEventListener('beforeunload',e=>{
+  const draft=document.getElementById('memo-input').value.trim();
+  if(!isDirty()&&!draft&&!pendingAttachments.length)return;
+  e.preventDefault();
+  e.returnValue='';
 });
 
 const savedTab=localStorage.getItem(LS_TAB);
