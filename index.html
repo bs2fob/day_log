@@ -372,6 +372,7 @@ const LS_DRAFT='dl_draft';
 const LS_TOMBS='dl_tombs';
 const LS_DIRTY='dl_dirty';
 const CHAIN_WEEKS=10;
+const SHARD_DIR='log_data';
 const TABS=['write','weeks','search','access','chain'];
 const GH_ACCESS_FILE='access.nfo';
 const LS_ACC='dl_access';
@@ -401,6 +402,47 @@ function cacheSave(){
 function cacheLoad(){
   try{const v=JSON.parse(localStorage.getItem(LS_LOGS)||'null');return Array.isArray(v)?v:null;}catch(e){return null;}
 }
+// 주차 10개가 한 덩어리다. 41 블록만 그 해 마지막 주차까지 품는다.
+// 항목이 어느 파일에 속하는지는 qcode 로 확정되며 이후 바뀌지 않는다.
+function shardOf(qc){
+  const m=qc.match(/^(\d{2})w(\d{2})/);
+  if(!m)return '';
+  const w=+m[2];
+  const b=w<=10?1:w<=20?11:w<=30?21:w<=40?31:41;
+  return `${m[1]}w${String(b).padStart(2,'0')}`;
+}
+function currentShard(){return shardOf(buildQcode(new Date()));}
+function shardUrl(sh){
+  const o=getOwner();if(!o)return null;
+  return `https://api.github.com/repos/${o}/${GH_REPO_NAME}/contents/${SHARD_DIR}/${sh}.nfo`;
+}
+function shardFileUrl(sh){return sh===currentShard()?ghApiUrl():shardUrl(sh);}
+
+let shardSha={};
+let shardSaved={};
+let loadedShards=new Set();
+let allLoaded=false;
+
+function getShardSha(sh){return sh===currentShard()?ghSha:(shardSha[sh]||null);}
+function setShardSha(sh,v){if(sh===currentShard())ghSha=v;else shardSha[sh]=v;}
+
+// 현재 블록은 루트 log.nfo, 나머지는 log_data/ 에 놓인다. 묘비는 루트에만 싣는다.
+function partitionLogs(){
+  const map=new Map();
+  for(const m of memos){
+    const sh=shardOf(m.qc);
+    if(!sh)continue;
+    if(!map.has(sh))map.set(sh,[]);
+    map.get(sh).push(m);
+  }
+  return map;
+}
+function serializeShard(sh,logs){
+  return sh===currentShard()
+    ? JSON.stringify({v:3,wk:sh,logs,tombs:readTombs()})
+    : JSON.stringify({v:3,wk:sh,logs});
+}
+
 // log.nfo 는 {v,logs,tombs} 객체다. 배열이던 옛 파일도 읽는다.
 function parseStore(v){
   if(Array.isArray(v))return {logs:v,tombs:[]};
@@ -486,6 +528,7 @@ async function resetCache(){
     try{localStorage.removeItem(k);}catch(e){}
   }
   memos=[];accessList=[];ghSha=null;accessSha=null;
+  shardSha={};shardSaved={};loadedShards=new Set();allLoaded=false;
   closeSetup();
   await loadMemos({silent:false});
   await loadAccess({silent:false});
@@ -523,6 +566,20 @@ async function saveSetup(){
 // ── 데이터 ──
 let memos=[];
 
+// 샤드 하나를 읽는다. 없으면 빈 것으로 본다.
+async function fetchShardFile(sh,token){
+  const url=shardFileUrl(sh);
+  const res=await fetch(url,{headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});
+  if(res.status===404){setShardSha(sh,null);return {logs:[],tombs:[]};}
+  if(!res.ok)throw new Error(`HTTP ${res.status}`);
+  const d=await res.json();
+  setShardSha(sh,d.sha);
+  const st=parseStore(JSON.parse(decodeURIComponent(escape(atob(d.content.replace(/\n/g,''))))));
+  absorbTombs(st.tombs);
+  shardSaved[sh]=serializeShard(sh,st.logs);
+  return st;
+}
+
 async function loadMemos({silent=false}={}){
   const token=getToken();const url=ghApiUrl();
   const cached=cacheLoad();
@@ -533,22 +590,15 @@ async function loadMemos({silent=false}={}){
   }
   if(!silent)setSyncIndicator('syncing','불러오는 중...');
   try{
-    const res=await fetch(url,{headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});
-    let store={logs:[],tombs:[]};
-    if(res.status===404){ghSha=null;}
-    else if(!res.ok)throw new Error(`HTTP ${res.status}`);
-    else{
-      const data=await res.json();
-      ghSha=data.sha;
-      store=parseStore(JSON.parse(decodeURIComponent(escape(atob(data.content.replace(/\n/g,''))))));
-    }
-    const absorbed=absorbTombs(store.tombs);
+    const cur=currentShard();
+    const store=await fetchShardFile(cur,token);
     memos=mergeLogs(store.logs,cached);
+    loadedShards.add(cur);
     cacheSave();
     renderAll();
-    const needPush=absorbed||!sameLogs(memos,store.logs)||store.tombs.length!==readTombs().length;
-    setSyncIndicator('ok',needPush?'병합분 저장 중...':`불러옴 ${new Date().toLocaleTimeString()}`);
-    if(needPush||isDirty())await saveMemos({fromLoad:true});
+    setSyncIndicator('ok',`불러옴 ${new Date().toLocaleTimeString()}`);
+    const rootLogs=partitionLogs().get(cur)||[];
+    if(isDirty()||shardSaved[cur]!==serializeShard(cur,rootLogs))await saveMemos({fromLoad:true});
   }catch(e){
     if(cached&&!memos.length){memos=cached;renderAll();}
     setSyncIndicator('error','불러오기 실패 · 로컬 표시');
@@ -556,52 +606,90 @@ async function loadMemos({silent=false}={}){
   }
 }
 
-async function fetchRemoteLogs(url,token){
-  const res=await fetch(url,{headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});
-  if(res.status===404){ghSha=null;return [];}
-  if(!res.ok)throw new Error(`HTTP ${res.status}`);
-  const d=await res.json();
-  ghSha=d.sha;
-  const store=parseStore(JSON.parse(decodeURIComponent(escape(atob(d.content.replace(/\n/g,''))))));
-  absorbTombs(store.tombs);
-  return store.logs;
-}
-
-function serializeStore(){
-  return JSON.stringify({v:2,logs:memos,tombs:readTombs()});
+// 검색·주차선택·연결은 전체를 훑으므로 과거 덩어리를 모두 받는다.
+async function loadAllShards(){
+  if(allLoaded)return;
+  const token=getToken();const o=getOwner();
+  if(!token||!o)return;
+  setSyncIndicator('syncing','과거 기록 불러오는 중...');
+  try{
+    const res=await fetch(`https://api.github.com/repos/${o}/${GH_REPO_NAME}/contents/${SHARD_DIR}`,
+      {headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});
+    if(res.ok){
+      const list=await res.json();
+      for(const f of list){
+        const sh=f.name.replace(/\.nfo$/,'');
+        if(!/^\d{2}w\d{2}$/.test(sh)||loadedShards.has(sh))continue;
+        const st=await fetchShardFile(sh,token);
+        memos=mergeLogs(st.logs,memos);
+        loadedShards.add(sh);
+      }
+    }
+    allLoaded=true;
+    cacheSave();
+    renderAll();
+    setSyncIndicator('ok',`불러옴 ${new Date().toLocaleTimeString()}`);
+  }catch(e){
+    setSyncIndicator('error','과거 기록 불러오기 실패');
+  }
 }
 
 let saving=false;
+
+// 덩어리 하나를 올린다. 충돌하면 다시 읽어 병합한 뒤 한 번 더 시도한다.
+async function putShardFile(sh,token){
+  const logs=partitionLogs().get(sh)||[];
+  const content=serializeShard(sh,logs);
+  if(shardSaved[sh]===content)return false;
+  const url=shardFileUrl(sh);
+  const send=body=>fetch(url,{method:'PUT',
+    headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},
+    body:JSON.stringify(body)});
+  const build=c=>{
+    const b={message:`log sync ${sh} ${buildQcode(new Date())}`,
+      content:btoa(unescape(encodeURIComponent(c)))};
+    const sha=getShardSha(sh);
+    if(sha)b.sha=sha;
+    return b;
+  };
+  let c=content;
+  let res=await send(build(c));
+  if(res.status===409||res.status===422){
+    const st=await fetchShardFile(sh,token);
+    memos=mergeLogs(st.logs,memos);
+    cacheSave();renderAll();
+    c=serializeShard(sh,partitionLogs().get(sh)||[]);
+    res=await send(build(c));
+  }
+  if(!res.ok)throw new Error(`HTTP ${res.status}`);
+  const j=await res.json();
+  setShardSha(sh,j.content.sha);
+  shardSaved[sh]=c;
+  return true;
+}
 
 // 원격을 읽어 병합한 뒤 올린다. 다른 기기가 쓴 것을 덮지 않는다.
 async function saveMemos({fromLoad=false,quiet=false}={}){
   cacheSave();
   setDirty(true);
-  const token=getToken();const url=ghApiUrl();
-  if(!token||!url){if(!quiet)openSetup();return;}
+  const token=getToken();
+  if(!token||!getOwner()){if(!quiet)openSetup();return;}
   if(saving)return;
   saving=true;
   setSyncIndicator('syncing','저장 중...');
   try{
-    let merged=mergeLogs(await fetchRemoteLogs(url,token),memos);
-    if(!sameLogs(merged,memos)){memos=merged;cacheSave();renderAll();}
-    const put=()=>{
-      const body={message:`log sync ${buildQcode(new Date())}`,
-        content:btoa(unescape(encodeURIComponent(serializeStore())))};
-      if(ghSha)body.sha=ghSha;
-      return fetch(url,{method:'PUT',
-        headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},
-        body:JSON.stringify(body)});
-    };
-    let res=await put();
-    if(res.status===409||res.status===422){
-      merged=mergeLogs(await fetchRemoteLogs(url,token),memos);
-      if(!sameLogs(merged,memos)){memos=merged;cacheSave();renderAll();}
-      res=await put();
+    const cur=currentShard();
+    const targets=new Set(partitionLogs().keys());
+    targets.add(cur);
+    // 아직 읽지 않은 덩어리는 먼저 읽어 병합한다
+    for(const sh of [...targets]){
+      if(loadedShards.has(sh))continue;
+      const st=await fetchShardFile(sh,token);
+      memos=mergeLogs(st.logs,memos);
+      loadedShards.add(sh);
     }
-    if(!res.ok)throw new Error(`HTTP ${res.status}`);
-    const j=await res.json();
-    ghSha=j.content.sha;
+    cacheSave();renderAll();
+    for(const sh of new Set([...partitionLogs().keys(),cur]))await putShardFile(sh,token);
     setDirty(false);
     setSyncIndicator('ok',`저장됨 ${new Date().toLocaleTimeString()}`);
   }catch(e){
@@ -757,6 +845,7 @@ function showTab(name){
   if(name==='weeks')renderWeekPicker();
   if(name==='chain')renderChain();
   if(name==='access')renderAccessTab();
+  if(name==='search'||name==='weeks'||name==='chain')loadAllShards();
 }
 
 function updateQnow(){
@@ -933,13 +1022,37 @@ async function openPdf(filename){
   }
 }
 
+// raw/ 파일을 지운다. 아직 참조가 남아 있으면 건드리지 않는다.
+async function deleteRawFiles(names){
+  const token=getToken();const o=getOwner();
+  if(!token||!o||!names.length)return;
+  const alive=new Set();
+  for(const m of memos)for(const a of (m.attachments||[]))alive.add(a.filename);
+  for(const fn of new Set(names)){
+    if(alive.has(fn))continue;
+    try{
+      const url=`https://api.github.com/repos/${o}/${GH_REPO_NAME}/contents/${GH_RAW_DIR}/${fn}`;
+      const meta=await fetch(url,{headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});
+      if(!meta.ok)continue;
+      const d=await meta.json();
+      await fetch(url,{method:'DELETE',
+        headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},
+        body:JSON.stringify({message:`raw drop ${fn}`,sha:d.sha})});
+    }catch(e){
+      console.error('첨부 삭제 실패',fn,e);
+    }
+  }
+}
+
 async function deleteAttach(memoId,attachIdx){
   const memo=memos.find(m=>m.id==memoId);
   if(!memo||!memo.attachments[attachIdx])return;
+  const fn=memo.attachments[attachIdx].filename;
   memo.attachments.splice(attachIdx,1);
   memo.mt=Date.now();
   renderAll();
   await saveMemos();
+  await deleteRawFiles([fn]);
 }
 
 function replaceImage(btn,memoId,attachIdx,filename){
@@ -1298,6 +1411,7 @@ function renderCurrentScroll(){
 function expandWriteWeek(){
   writeWeeksShown++;
   renderCurrentScroll();
+  loadAllShards();
 }
 
 // ── 주차선택 ──
@@ -1443,11 +1557,17 @@ async function saveMemo(){
 }
 
 async function deleteMemo(id){
-  if(!confirm('이 로그를 삭제합니까?\n(첨부 파일은 raw 폴더에 남습니다)'))return;
+  const memo=memos.find(m=>m.id===id);
+  const files=(memo&&memo.attachments||[]).map(a=>a.filename);
+  const q=files.length
+    ?`이 로그와 첨부 ${files.length}개를 함께 삭제합니까?\n되돌릴 수 없습니다.`
+    :'이 로그를 삭제합니까?';
+  if(!confirm(q))return;
   addTomb(id);
   memos=memos.filter(m=>m.id!==id);
   renderAll();
   await saveMemos();
+  await deleteRawFiles(files);
 }
 
 // ── 초기화 ──
