@@ -339,12 +339,29 @@ function cacheSave(){
 function cacheLoad(){
   try{const v=JSON.parse(localStorage.getItem(LS_LOGS)||'null');return Array.isArray(v)?v:null;}catch(e){return null;}
 }
+// log.nfo 는 {v,logs,tombs} 객체다. 배열이던 옛 파일도 읽는다.
+function parseStore(v){
+  if(Array.isArray(v))return {logs:v,tombs:[]};
+  if(v&&typeof v==='object')return {logs:Array.isArray(v.logs)?v.logs:[],tombs:Array.isArray(v.tombs)?v.tombs:[]};
+  return {logs:[],tombs:[]};
+}
 function readTombs(){
   try{const v=JSON.parse(localStorage.getItem(LS_TOMBS)||'[]');return Array.isArray(v)?v:[];}catch(e){return [];}
 }
+function writeTombs(list){
+  try{localStorage.setItem(LS_TOMBS,JSON.stringify(list));}catch(e){}
+}
 function addTomb(id){
   const t=readTombs();
-  if(!t.includes(id)){t.push(id);try{localStorage.setItem(LS_TOMBS,JSON.stringify(t));}catch(e){}}
+  if(!t.includes(id)){t.push(id);writeTombs(t);}
+}
+// 원격 묘비를 로컬에 흡수한다. 다른 기기의 삭제가 이 기기에서도 유지된다.
+function absorbTombs(remoteTombs){
+  const t=readTombs();
+  let changed=false;
+  for(const id of (remoteTombs||[]))if(!t.includes(id)){t.push(id);changed=true;}
+  if(changed)writeTombs(t);
+  return changed;
 }
 function setDirty(v){
   try{v?localStorage.setItem(LS_DIRTY,'1'):localStorage.removeItem(LS_DIRTY);}catch(e){}
@@ -443,18 +460,19 @@ async function loadMemos({silent=false}={}){
   if(!silent)setSyncIndicator('syncing','불러오는 중...');
   try{
     const res=await fetch(url,{headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json'}});
-    let remote=[];
+    let store={logs:[],tombs:[]};
     if(res.status===404){ghSha=null;}
     else if(!res.ok)throw new Error(`HTTP ${res.status}`);
     else{
       const data=await res.json();
       ghSha=data.sha;
-      remote=JSON.parse(decodeURIComponent(escape(atob(data.content.replace(/\n/g,'')))));
+      store=parseStore(JSON.parse(decodeURIComponent(escape(atob(data.content.replace(/\n/g,''))))));
     }
-    memos=mergeLogs(remote,cached);
+    const absorbed=absorbTombs(store.tombs);
+    memos=mergeLogs(store.logs,cached);
     cacheSave();
     renderAll();
-    const needPush=!sameLogs(memos,remote);
+    const needPush=absorbed||!sameLogs(memos,store.logs)||store.tombs.length!==readTombs().length;
     setSyncIndicator('ok',needPush?'병합분 저장 중...':`불러옴 ${new Date().toLocaleTimeString()}`);
     if(needPush||isDirty())await saveMemos({fromLoad:true});
   }catch(e){
@@ -470,7 +488,13 @@ async function fetchRemoteLogs(url,token){
   if(!res.ok)throw new Error(`HTTP ${res.status}`);
   const d=await res.json();
   ghSha=d.sha;
-  return JSON.parse(decodeURIComponent(escape(atob(d.content.replace(/\n/g,'')))));
+  const store=parseStore(JSON.parse(decodeURIComponent(escape(atob(d.content.replace(/\n/g,''))))));
+  absorbTombs(store.tombs);
+  return store.logs;
+}
+
+function serializeStore(){
+  return JSON.stringify({v:2,logs:memos,tombs:readTombs()});
 }
 
 let saving=false;
@@ -489,7 +513,7 @@ async function saveMemos({fromLoad=false,quiet=false}={}){
     if(!sameLogs(merged,memos)){memos=merged;cacheSave();renderAll();}
     const put=()=>{
       const body={message:`log sync ${buildQcode(new Date())}`,
-        content:btoa(unescape(encodeURIComponent(JSON.stringify(memos))))};
+        content:btoa(unescape(encodeURIComponent(serializeStore())))};
       if(ghSha)body.sha=ghSha;
       return fetch(url,{method:'PUT',
         headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},
