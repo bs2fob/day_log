@@ -1214,16 +1214,34 @@ function weekSectionHtml(wk,items,ctx,keyword=''){
   </div>`;
 }
 
+// 작성 탭 두루마리. 이번 주차부터 시작해 버튼으로 한 주차씩 거슬러 올라간다.
+let writeWeeksShown=1;
+
 function renderCurrentScroll(){
   const el=document.getElementById('current-scroll');
-  const wk=weekKey(buildQcode(new Date()));
-  const items=groupByWeek(memos).get(wk)||[];
-  if(!items.length){
-    el.innerHTML=`<div class="card-title">이번 주차 ${weekLabel(wk)}</div><div class="empty">이번 주차 기록이 없습니다.</div>`;
-    return;
-  }
-  el.innerHTML=weekSectionHtml(wk,items,'c');
+  const groups=groupByWeek(memos);
+  const cur=weekKey(buildQcode(new Date()));
+  const keys=weekKeysDesc();
+  if(!keys.includes(cur))keys.unshift(cur);
+  if(writeWeeksShown>keys.length)writeWeeksShown=keys.length;
+  const body=keys.slice(0,writeWeeksShown).map(wk=>{
+    const items=groups.get(wk)||[];
+    if(items.length)return weekSectionHtml(wk,items,'c');
+    return `<div class="week-section">
+      <div class="week-header"><span class="week-label">${weekLabel(wk)}</span><span class="week-count">0건 · ${wk}</span></div>
+      <div class="empty">이 주차 기록이 없습니다.</div>
+    </div>`;
+  }).join('');
+  const more=writeWeeksShown<keys.length
+    ?`<div style="text-align:center;margin-top:10px"><button class="btn btn-ghost" onclick="expandWriteWeek()">이전 주차 더보기</button></div>`
+    :'';
+  el.innerHTML=body+more;
   setTimeout(loadAllAudioBlobs,50);
+}
+
+function expandWriteWeek(){
+  writeWeeksShown++;
+  renderCurrentScroll();
 }
 
 // ── 주차선택 ──
