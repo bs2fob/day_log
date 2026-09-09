@@ -410,7 +410,7 @@ function mergeLogs(remote,local){
   for(const m of (remote||[]))map.set(m.id,m);
   for(const m of (local||[])){
     const r=map.get(m.id);
-    if(!r||(m.mt||0)>=(r.mt||0))map.set(m.id,m);
+    if(!r||(m.mt||0)>(r.mt||0))map.set(m.id,m);
   }
   return [...map.values()].filter(m=>!dead.has(m.id))
     .sort((a,b)=>a.qc<b.qc?1:a.qc>b.qc?-1:b.id-a.id);
@@ -1020,7 +1020,7 @@ function mergeAccess(remote,local){
   for(const a of (remote||[]))map.set(a.id,a);
   for(const a of (local||[])){
     const r=map.get(a.id);
-    if(!r||(a.mt||0)>=(r.mt||0))map.set(a.id,a);
+    if(!r||(a.mt||0)>(r.mt||0))map.set(a.id,a);
   }
   return [...map.values()].filter(a=>!dead.has(a.id)).sort((a,b)=>b.id-a.id);
 }
