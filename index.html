@@ -110,6 +110,9 @@ html,body{background:var(--bg);color:var(--text);font-family:-apple-system,Blink
 
 .attach-pdf-row{display:flex;align-items:center;gap:6px}
 
+.attach-broken{display:flex;align-items:center;gap:8px;padding:10px 12px;background:var(--surface2);border:1px dashed var(--red);border-radius:var(--radius-sm);color:var(--text2);font-size:12px}
+.attach-broken code{color:var(--red);font-family:'Courier New',monospace}
+
 .memo-actions{display:flex;gap:6px;margin-top:10px}
 .memo-act-btn{background:none;border:1px solid var(--border);border-radius:var(--radius-sm);color:var(--text3);font-size:12px;padding:4px 10px;cursor:pointer}
 .memo-act-btn:hover{color:var(--text);border-color:var(--border2)}
@@ -178,6 +181,10 @@ mark{background:var(--amber-bg);color:var(--amber);border-radius:2px;padding:0 2
     <div class="modal-hint">발급: GitHub → Settings → Developer settings → Fine-grained tokens<br>→ <b>day_log</b> 저장소 선택 → Contents: Read and write</div>
     <button id="setup-save-btn" class="btn btn-accent" style="width:100%;height:40px" onclick="saveSetup()">시작하기</button>
     <div id="setup-error" class="modal-err"></div>
+    <div style="margin-top:18px;padding-top:16px;border-top:1px solid var(--border)">
+      <div class="modal-hint" style="margin-bottom:8px">이 기기에 남은 사본이 원격과 어긋날 때 씁니다. 저장되지 않은 작성분이 있으면 사라집니다.</div>
+      <button class="btn btn-ghost" style="width:100%" onclick="resetCache()">로컬 사본 비우고 다시 받기</button>
+    </div>
   </div>
 </div>
 
@@ -472,6 +479,18 @@ function openSetup(){
   document.getElementById('setup-error').style.display='none';
 }
 function closeSetup(){document.getElementById('setup-modal').style.display='none';}
+
+// 로컬 사본을 버리고 원격에서 다시 받는다. 묘비와 작성 중 초안은 남긴다.
+async function resetCache(){
+  if(!confirm('이 기기에 남은 사본을 버리고 원격에서 다시 받습니까?\n아직 저장되지 않은 내용이 있으면 사라집니다.'))return;
+  for(const k of [LS_LOGS,LS_ACC,LS_DIRTY,LS_ACC_DIRTY]){
+    try{localStorage.removeItem(k);}catch(e){}
+  }
+  memos=[];accessList=[];ghSha=null;accessSha=null;
+  closeSetup();
+  await loadMemos({silent:false});
+  await loadAccess({silent:false});
+}
 
 async function saveSetup(){
   const token=document.getElementById('setup-token').value.trim();
@@ -782,7 +801,7 @@ function attachHtml(attachments,memoId,ctx='r',keyword=''){
     if(a.type==='image'){
       const url=rawPublicUrl(a.filename);
       return `<div class="attach-img-wrap">
-        <img class="attach-img" src="${url}?t=${Date.now()}" alt="${escHtml(a.filename)}" onclick="openLightbox('${url}')">
+        <img class="attach-img" src="${url}?t=${Date.now()}" alt="${escHtml(a.filename)}" onclick="openLightbox('${url}')" onerror="markBrokenImage(this,'${escHtml(a.filename)}')">
         <button class="attach-replace-btn" onclick="replaceImage(this,${memoId},${ai},'${escHtml(a.filename)}')" title="이미지 교체">교체</button>
         <button class="attach-del-btn" onclick="deleteAttach(${memoId},${ai})" title="삭제">✕</button>
         <input type="file" accept="image/*" id="replace-input-${ctx}-${memoId}-${ai}" style="display:none" onchange="doReplaceImage(this,${memoId},${ai},'${escHtml(a.filename)}')">
@@ -1194,6 +1213,14 @@ async function commitAccessPlace(e,id){
   entry.mt=Date.now();
   renderAccessTab();
   await saveAccess();
+}
+
+// 첨부 파일이 저장소에 없을 때 조용히 깨지지 않도록 파일명을 드러낸다.
+function markBrokenImage(img,filename){
+  const wrap=img.parentElement;
+  if(!wrap||wrap.dataset.broken)return;
+  wrap.dataset.broken='1';
+  wrap.innerHTML=`<div class="attach-broken">🖼 <span>불러올 수 없는 이미지</span><code>${escHtml(filename)}</code></div>`;
 }
 
 // 라이트박스
