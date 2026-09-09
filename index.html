@@ -605,8 +605,12 @@ function removeAttach(i){
   renderPreview();
 }
 
-// 이미지를 JPEG 91품질로 변환 후 base64 반환
-function imageToJpegBase64(file){
+const IMG_FORMAT='webp';
+const IMG_QUALITY=0.90;
+
+// 이미지를 WebP 90품질로 변환한다. 인코딩을 지원하지 않는 브라우저는 JPEG 로 물러선다.
+// 반환값 {b64, ext} — ext 가 저장 파일명의 확장자가 된다.
+function encodeImage(file,format=IMG_FORMAT){
   return new Promise((res,rej)=>{
     const img=new Image();
     const url=URL.createObjectURL(file);
@@ -615,17 +619,30 @@ function imageToJpegBase64(file){
       canvas.width=img.naturalWidth;
       canvas.height=img.naturalHeight;
       const ctx=canvas.getContext('2d');
-      ctx.fillStyle='#ffffff';
-      ctx.fillRect(0,0,canvas.width,canvas.height);
-      ctx.drawImage(img,0,0);
-      URL.revokeObjectURL(url);
-      canvas.toBlob(blob=>{
-        if(!blob){rej(new Error('JPEG 변환 실패'));return;}
+      const draw=opaque=>{
+        ctx.clearRect(0,0,canvas.width,canvas.height);
+        if(opaque){ctx.fillStyle='#ffffff';ctx.fillRect(0,0,canvas.width,canvas.height);}
+        ctx.drawImage(img,0,0);
+      };
+      const emit=(blob,ext)=>{
         const r=new FileReader();
-        r.onload=()=>res(r.result.split(',')[1]);
+        r.onload=()=>{URL.revokeObjectURL(url);res({b64:r.result.split(',')[1],ext});};
         r.onerror=rej;
         r.readAsDataURL(blob);
-      },'image/jpeg',0.91);
+      };
+      const toJpeg=()=>{
+        draw(true);
+        canvas.toBlob(b=>{
+          if(!b){URL.revokeObjectURL(url);rej(new Error('이미지 변환 실패'));return;}
+          emit(b,'jpg');
+        },'image/jpeg',0.91);
+      };
+      if(format!=='webp'){toJpeg();return;}
+      draw(false);
+      canvas.toBlob(blob=>{
+        if(blob&&blob.type==='image/webp'){emit(blob,'webp');return;}
+        toJpeg();
+      },'image/webp',IMG_QUALITY);
     };
     img.onerror=()=>{URL.revokeObjectURL(url);rej(new Error('이미지 로드 실패'));};
     img.src=url;
@@ -672,10 +689,9 @@ function resolveFilename(qc,ext,existingNames,localUsed){
   throw new Error('파일 번호가 99를 초과합니다.');
 }
 
-async function uploadFile(file,filename,isImage=false){
+async function uploadFile(b64,filename){
   const token=getToken();
   const url=ghRawApiUrl(filename);
-  const b64=isImage?await imageToJpegBase64(file):await fileToBase64(file);
   const body={message:`raw ${filename}`,content:b64};
   const res=await fetch(url,{method:'PUT',
     headers:{Authorization:`Bearer ${token}`,Accept:'application/vnd.github+json','Content-Type':'application/json'},
@@ -907,7 +923,8 @@ async function doReplaceImage(input,memoId,attachIdx,filename){
     );
     if(!metaRes.ok)throw new Error(`SHA 조회 실패 ${metaRes.status}`);
     const meta=await metaRes.json();
-    const b64=await imageToJpegBase64(file);
+    const enc=await encodeImage(file,fileExt(filename)==='webp'?'webp':'jpeg');
+    const b64=enc.b64;
     const putRes=await fetch(
       `https://api.github.com/repos/${o}/${GH_REPO_NAME}/contents/${GH_RAW_DIR}/${filename}`,
       {method:'PUT',
@@ -1329,10 +1346,11 @@ async function saveMemo(){
     for(let i=0;i<pendingAttachments.length;i++){
       const a=pendingAttachments[i];
       try{
-        const ext=a.type==='image'?'jpg':fileExt(a.file.name);
+        const enc=a.type==='image'?await encodeImage(a.file):null;
+        const ext=enc?enc.ext:fileExt(a.file.name);
         const filename=resolveFilename(qc,ext,existingNames,localUsed);
         prog.textContent=`업로드 중 (${i+1}/${pendingAttachments.length}) ${filename}`;
-        await uploadFile(a.file,filename,a.type==='image');
+        await uploadFile(enc?enc.b64:await fileToBase64(a.file),filename);
         attachments.push({type:a.type,filename,origName:(a.type==='pdf'||a.type==='audio')?a.file.name:undefined});
       }catch(e){
         prog.style.display='none';btn.disabled=false;
